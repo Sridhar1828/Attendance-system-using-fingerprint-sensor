@@ -1,0 +1,135 @@
+1.Source Code
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SoftwareSerial.h>
+#include <Adafruit_Fingerprint.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP8266WebServer.h>
+#include <WiFiClientSecure.h>
+
+// ------------------ OLED ------------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void showMessage(String line1, String line2="") {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,10);
+  display.println(line1);
+  if(line2.length()>0){
+    display.setCursor(0,25);
+    display.println(line2);
+  }
+  display.display();
+}
+
+// ------------------ Fingerprint ------------------
+SoftwareSerial fingerSerial(D6, D7); 
+Adafruit_Fingerprint finger(&fingerSerial);
+
+// ------------------ Wi-Fi & Firebase ------------------
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const String firebaseHost = "trackmate-07-default-rtdb.firebaseio.com"; // HTTPS required
+const String busID = "Bus1"; 
+
+WiFiClientSecure client;
+
+// ------------------ Web Server ------------------
+ESP8266WebServer server(80);
+
+// ------------------ Dummy Date/Time ------------------
+String getDate(){ return "2025-09-28"; }
+String getTime(){ return "12:00:00"; }
+
+// ------------------ Firebase Functions ------------------
+void sendToFirebase(String path, String json) {
+  if(WiFi.status() == WL_CONNECTED){
+    HTTPClient http;
+    client.setInsecure(); // allow HTTPS
+    String url = "https://" + firebaseHost + "/" + path + ".json";
+    http.begin(client, url);
+    http.addHeader("Content-Type","application/json");
+    int code = http.PUT(json);
+    Serial.println("Firebase PUT response: " + String(code));
+    http.end();
+  }
+}
+
+String getFromFirebase(String path){
+  String payload = "";
+  if(WiFi.status() == WL_CONNECTED){
+    HTTPClient http;
+    client.setInsecure();
+    String url = "https://" + firebaseHost + "/" + path + ".json";
+    http.begin(client, url);
+    int code = http.GET();
+    if(code == 200) payload = http.getString();
+    http.end();
+  }
+  return payload;
+}
+
+// ------------------ Fingerprint Functions ------------------
+String enrollFinger(int id, String name){
+  showMessage("Enroll Mode","Place Finger");
+  int p=-1;
+  while(p != FINGERPRINT_OK) p = finger.getImage();
+  p = finger.image2Tz(1);
+  if(p != FINGERPRINT_OK) return "Error: First scan failed";
+
+  showMessage("Remove Finger");
+  delay(2000);
+
+  showMessage("Place Again");
+  p=-1; while(p != FINGERPRINT_OK) p = finger.getImage();
+  p = finger.image2Tz(2);
+  if(p != FINGERPRINT_OK) return "Error: Second scan failed";
+
+  p = finger.createModel();
+  if(p != FINGERPRINT_OK){ return "Error: Fingerprint mismatch"; }
+
+  p = finger.storeModel(id);
+  if(p != FINGERPRINT_OK){ return "Error: Store failed"; }
+
+  String json = "{\"id\":"+String(id)+",\"name\":\""+name+"\",\"fingerprintStored\":true,\"bus\":\""+busID+"\"}";
+  sendToFirebase("students/"+String(id), json);
+
+  showMessage("Enroll Success","ID:"+String(id));
+  return "Enrolled successfully: " + name;
+}
+
+String verifyFinger(){
+  showMessage("Verify Mode","Place Finger");
+  int p = finger.getImage();
+  if(p == FINGERPRINT_OK){
+    showMessage("Checking...");
+    p = finger.image2Tz();
+    if(p == FINGERPRINT_OK){
+      p = finger.fingerFastSearch();
+      if(p == FINGERPRINT_OK){
+        int id = finger.fingerID;
+        String json = getFromFirebase("students/"+String(id));
+        if(json != "null"){
+          DynamicJsonDocument doc(256);
+          deserializeJson(doc,json);
+          String name = doc["name"];
+          showMessage("Welcome", name);
+
+          String att="{\"id\":"+String(id)+",\"name\":\""+name+"\",\"date\":\""+getDate()+"\",\"time\":\""+getTime()+"\",\"bus\":\""+busID+"\"}";
+          sendToFirebase("attendance/"+String(id)+"_"+String(millis()),att);
+          delay(2000);
+          return "Access Granted: " + name;
+        } else { showMessage("Access Denied"); return "Access Denied"; }
+      } else { showMessage("Access Denied"); return "Access Denied"; }
+    }
+  }
+  return "No Finger Detected";
+}
